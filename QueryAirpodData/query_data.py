@@ -36,10 +36,9 @@ import gzip
 import json
 import os
 import random
-import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import datetime
 from io import BytesIO
 
@@ -374,16 +373,10 @@ def main():
     print(f"[query] bucket={bucket_name} mongo_db={mongo_db} collection={collection}", flush=True)
     print(f"[query] resume: {len(found)} already found, {len(checked)} already checked", flush=True)
 
-    delivery_by_uuid = {}
-    pending = []
-    for u, delivery in iter_mongo_sessions(mongo_uri, mongo_db, collection, args.limit):
-        delivery_by_uuid[u] = delivery
-        if u not in checked:
-            pending.append(u)
-    print(f"[query] {len(pending)} session(s) to check "
-          f"(workers={args.workers}, samples/session={args.samples})", flush=True)
+    print("[query] streaming UUIDs from Mongo and checking as they arrive "
+          f"(workers={args.workers}, samples/session={args.samples}); "
+          "Ctrl-C to stop — progress is saved and resumable", flush=True)
 
-    out_lock = threading.Lock()
     out_new = not os.path.exists(args.out) or os.path.getsize(args.out) == 0
     out_f = open(args.out, "a", newline="")
     out_writer = csv.writer(out_f)
@@ -400,45 +393,63 @@ def main():
     first_error = None
     start = time.time()
 
-    def handle(uuid_str):
+    def handle(uuid_str, delivery):
         try:
-            return uuid_str, classify_session(uuid_str, args.samples, args.seed), None
+            return uuid_str, delivery, classify_session(uuid_str, args.samples, args.seed), None
         except Exception as exc:  # network blips etc.: log & keep going
-            return uuid_str, ST_ERROR, exc
+            return uuid_str, delivery, ST_ERROR, exc
 
+    def process(result):
+        """Consume one finished session (main thread only — no locking needed)."""
+        nonlocal first_error
+        uuid_str, delivery, status, exc = result
+        counts[status] += 1
+
+        if status == ST_ERROR:
+            if first_error is None:
+                first_error = f"{uuid_str}: {exc!r}"
+                print(f"[query] first error — {first_error}", flush=True)
+            return  # not persisted -> retried on the next run
+
+        if status == ST_HEADPHONE and uuid_str not in found:
+            found.add(uuid_str)
+            out_writer.writerow([uuid_str, delivery])
+            out_f.flush()
+
+        log_f.write(f"{uuid_str},{status}\n")
+        log_f.flush()
+
+        done = sum(counts.values())
+        if done % 100 == 0:
+            ios_total = counts[ST_HEADPHONE] + counts[ST_IOS_NONE]
+            rate = done / max(time.time() - start, 1e-9)
+            print(f"[query] checked={done} headphone={counts[ST_HEADPHONE]} "
+                  f"ios={ios_total} not_ios={counts[ST_NOT_IOS]} "
+                  f"nodata={counts[ST_NODATA]} error={counts[ST_ERROR]} "
+                  f"({rate:.1f}/s)", flush=True)
+
+    # Bound the number of in-flight tasks so we neither read all of Mongo into
+    # memory up front nor starve the workers.
+    max_inflight = max(args.workers * 4, args.workers + 1)
+    inflight = set()
+    submitted = 0
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            for uuid_str, status, exc in _as_completed_map(ex, handle, pending):
-                counts[status] += 1
-
-                if status == ST_ERROR:
-                    if first_error is None:
-                        first_error = f"{uuid_str}: {exc!r}"
-                        print(f"[query] first error — {first_error}", flush=True)
-                    continue  # not persisted -> retried on the next run
-
-                if status == ST_HEADPHONE:
-                    with out_lock:
-                        if uuid_str not in found:
-                            found.add(uuid_str)
-                            out_writer.writerow([uuid_str, delivery_by_uuid.get(uuid_str, "")])
-                            out_f.flush()
-
-                with out_lock:
-                    log_f.write(f"{uuid_str},{status}\n")
-                    log_f.flush()
-
-                done = sum(counts.values())
-                if done % 100 == 0:
-                    ios_total = counts[ST_HEADPHONE] + counts[ST_IOS_NONE]
-                    rate = done / max(time.time() - start, 1e-9)
-                    print(f"[query] checked={done} headphone={counts[ST_HEADPHONE]} "
-                          f"ios={ios_total} not_ios={counts[ST_NOT_IOS]} "
-                          f"nodata={counts[ST_NODATA]} error={counts[ST_ERROR]} "
-                          f"({rate:.1f}/s)", flush=True)
+            for uuid_str, delivery in iter_mongo_sessions(mongo_uri, mongo_db, collection, args.limit):
+                if uuid_str in checked:
+                    continue
+                inflight.add(ex.submit(handle, uuid_str, delivery))
+                submitted += 1
+                if len(inflight) >= max_inflight:
+                    done_set, inflight = wait(inflight, return_when=FIRST_COMPLETED)
+                    for fut in done_set:
+                        process(fut.result())
+            for fut in as_completed(inflight):
+                process(fut.result())
     finally:
         out_f.close()
         log_f.close()
+    print(f"[query] submitted {submitted} session(s) this run", flush=True)
 
     write_report(
         args.checked_log,
@@ -459,13 +470,6 @@ def main():
           flush=True)
     print(f"[query] matches -> {args.out}", flush=True)
     print(f"[query] report  -> {args.readme}", flush=True)
-
-
-def _as_completed_map(ex, fn, items):
-    """Submit fn over items and yield results as they complete."""
-    futures = [ex.submit(fn, it) for it in items]
-    for fut in as_completed(futures):
-        yield fut.result()
 
 
 if __name__ == "__main__":
