@@ -1,0 +1,11 @@
+# Secrets / config
+.env
+*-key.json
+*credentials*.json
+
+# Local venv & caches
+.venv/
+__pycache__/
+
+# Large run artifact (per-session status log)
+headphoneMotion_checked.log

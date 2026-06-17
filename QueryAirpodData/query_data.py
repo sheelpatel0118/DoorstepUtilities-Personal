@@ -1,61 +1,131 @@
 #!/usr/bin/env python3
 """Find iOS sessions whose GCS data contains headphoneMotion (AirPod IMU) data.
 
-This is a lightweight presence check: instead of calling retrieve_session() (which
-downloads every chunk, decompresses, preprocesses, dedupes, unit-converts, and
-interpolates), it reuses only the GCS access primitives, reads a stratified sample
-of chunks across each session's timeline, and short-circuits the moment it finds a
-chunk carrying the raw ``headphone_internal_sensor`` stream.
+Fully self-contained — depends only on pip packages (google-cloud-storage,
+pymongo, and optionally python-dotenv). It does NOT import from or run inside the
+data-processing repo.
 
-UUIDs are enumerated from MongoDB (same connection pattern as generate_csv.py).
-Matching sessions are written to headphoneMotion_uuid_list.csv (uuid,deliveryType),
-and a small report (headphone sessions vs. total iOS sessions) is written to README.md.
+This is a lightweight presence check. For each session it reads the small
+main_session.json to find the capture id, lists the iOS chunk blobs, samples a
+handful of chunks spread across the session timeline, and checks each for the raw
+``headphone_internal_sensor`` stream — stopping at the first hit. (It deliberately
+avoids the heavy full retrieve/preprocess/interpolate path.)
 
-Run with the data-processing repo's virtualenv, e.g.:
+UUIDs are enumerated from MongoDB. Matching sessions are written to
+headphoneMotion_uuid_list.csv (uuid,deliveryType), and a small report (headphone
+sessions vs. total iOS sessions) is written to README.md.
 
-    cd <data-processing>
-    .venv/bin/python <this-repo>/QueryAirpodData/query_data.py --limit 200
+Configuration (CLI flag > environment variable > local .env in this folder):
+    GCS bucket   : --gcs-bucket / GCS_BUCKET
+    GCS key file : --gcs-key   / GCS_CREDENTIALS_PATH / GOOGLE_APPLICATION_CREDENTIALS
+                   (omit to use Application Default Credentials)
+    Mongo URI    : --mongo-uri / MONGO_URI / MONGO_MAIN_URI
+    Mongo db     : --mongo-db  / MONGO_DB  / MONGO_MAIN_DB            (default: main)
+    Collection   : --collection / MONGO_COLLECTION / MONGO_TRACKING_COLLECTION
+                   (default: tracking_sessions_v3)
+
+Setup & run:
+    python3 -m venv .venv && . .venv/bin/activate
+    pip install -r requirements.txt
+    python query_data.py --limit 300        # smoke test; drop --limit for a full sweep
 """
 
-# --- Bootstrap into the data-processing repo BEFORE importing packages.* ------
+import argparse
+import csv
+import gzip
+import json
 import os
-import sys
+import random
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from io import BytesIO
 
-DP_ROOT = "/Users/sheelpatel/Documents/doorstepai/doorstepai-track/DataProcessing/reclone/data-processing"
+from google.cloud import storage
+from google.oauth2 import service_account
+from google.api_core.exceptions import NotFound
+from pymongo import MongoClient
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-sys.path.insert(0, DP_ROOT)
-os.chdir(DP_ROOT)  # so the relative GCS_CREDENTIALS_PATH / .env in helper.py resolve
+# Optional: load a local .env in this folder (python-dotenv is optional).
+try:
+    from dotenv import load_dotenv
 
-from dotenv import load_dotenv  # noqa: E402
-
-load_dotenv(os.path.join(DP_ROOT, ".env"))
-
-# helper.py calls load_dotenv() at import; cwd is now DP_ROOT so it finds .env.
-from packages.db.gcs.helper import (  # noqa: E402
-    _gcs_client,
-    _gcs_read_json,
-    _gcs_list_chunks,
-    _gcs_read_chunk_json,
-    _uuid_v1_epoch,
-)
-import google.api_core.exceptions  # noqa: E402
-from pymongo import MongoClient  # noqa: E402
-
-# --- Stdlib --------------------------------------------------------------------
-import argparse  # noqa: E402
-import csv  # noqa: E402
-import random  # noqa: E402
-import threading  # noqa: E402
-import time  # noqa: E402
-from datetime import datetime  # noqa: E402
-from concurrent.futures import ThreadPoolExecutor, as_completed  # noqa: E402
+    load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
+except Exception:
+    pass
 
 
-# The raw per-chunk key that carries headphone (AirPod) IMU rows. See
-# packages/db/gcs/retrieve.py: _STREAM_OUTPUT_KEY maps it to 'headphone_motion'
-# and _IMU_STREAM_KEYS lists it. Keys tried (in order) to find the capture id.
+# --- GCS access primitives (self-contained; mirror the data-processing repo) ---
+# Offset between the UUIDv1 epoch (1582-10-15) and the Unix epoch, in 100ns ticks.
+_UUID_V1_GREGORIAN_OFFSET = 0x01B21DD213814000
+
+
+def make_bucket(bucket_name: str, key_path):
+    """Return a GCS bucket handle, with a generous HTTP connection pool.
+
+    Uses an explicit service-account key file when key_path is given, otherwise
+    falls back to Application Default Credentials.
+    """
+    if key_path:
+        creds = service_account.Credentials.from_service_account_file(key_path)
+        client = storage.Client(credentials=creds)
+    else:
+        client = storage.Client()
+    try:
+        from requests.adapters import HTTPAdapter
+
+        adapter = HTTPAdapter(pool_connections=64, pool_maxsize=64, max_retries=3)
+        client._http.mount("https://", adapter)
+        client._http.mount("http://", adapter)
+    except Exception:
+        pass
+    return client.bucket(bucket_name)
+
+
+def gcs_read_json(bucket, blob_name):
+    """Download and parse a JSON blob."""
+    return json.loads(bucket.blob(blob_name).download_as_bytes().decode("utf-8"))
+
+
+def gcs_list_chunks(bucket, capture_session_id, platform):
+    """Sorted list of chunk blob names for a session's platform (metadata-only)."""
+    prefix = f"platform_sessions/captureSessionId={capture_session_id}/{platform}/"
+    out = [b.name for b in bucket.list_blobs(prefix=prefix) if b.name.endswith("/chunk.jsonl.gz")]
+    out.sort()
+    return out
+
+
+def gcs_read_chunk_json(bucket, blob_name):
+    """Download + gunzip + parse the single JSON line in a chunk blob."""
+    gz_bytes = bucket.blob(blob_name).download_as_bytes()
+    with gzip.GzipFile(fileobj=BytesIO(gz_bytes), mode="rb") as f:
+        line = f.readline()
+    return json.loads(line.decode("utf-8"))
+
+
+def uuid_v1_epoch(blob_name):
+    """Epoch seconds embedded in a chunk blob's UUIDv1 directory name, or None.
+
+    Lexical blob-name order is NOT time order (v1 puts time-low first), so this is
+    the only way to time-order chunks without downloading them.
+    """
+    try:
+        u = uuid.UUID(blob_name.rsplit("/", 2)[-2])
+    except (ValueError, IndexError):
+        return None
+    if u.version != 1:
+        return None
+    return (u.time - _UUID_V1_GREGORIAN_OFFSET) / 1e7
+
+
+# --- Headphone detection -------------------------------------------------------
+# The raw per-chunk key that carries headphone (AirPod) IMU rows.
 HEADPHONE_KEY = "headphone_internal_sensor"
+# Keys tried (in order) to find the capture id inside main_session.json.
 CAPTURE_ID_KEYS = ("capturesessionid", "capture_session_id", "session_id", "captureSessionId")
 
 # Per-session classification statuses (persisted in the checked log).
@@ -65,7 +135,7 @@ ST_NOT_IOS = "not_ios"              # session has no iOS chunks (android / empty
 ST_NODATA = "nodata"               # no main_session.json found
 ST_ERROR = "error"                 # transient failure (NOT persisted -> retried)
 
-# Module-level GCS handle, initialised once in main() (the helper caches it too).
+# Module-level GCS handle, initialised once in main().
 _BUCKET = None
 
 
@@ -84,16 +154,11 @@ def _chunk_has_headphone(chunk) -> bool:
 
 
 def _resolve_capture_id(uuid_str: str):
-    """Return capture_session_id for a session UUID, or None if no main session.
-
-    Reads main_sessions/main_session_id={uuid}/main_session.json (small) and
-    extracts the capture id, falling back to the uuid itself when present but
-    unlabelled.
-    """
+    """Return capture_session_id for a session UUID, or None if no main session."""
     blob = f"main_sessions/main_session_id={uuid_str}/main_session.json"
     try:
-        main_data = _gcs_read_json(_BUCKET, blob)
-    except google.api_core.exceptions.NotFound:
+        main_data = gcs_read_json(_BUCKET, blob)
+    except NotFound:
         return None
     if not isinstance(main_data, dict):
         return None
@@ -106,14 +171,13 @@ def _resolve_capture_id(uuid_str: str):
 def _stratified_sample(blobs, n_samples: int, rng: random.Random):
     """Pick n_samples chunk blobs spread across the time-ordered session.
 
-    Chunks are time-ordered via their UUIDv1 directory epoch (lexical order is
-    NOT time order); undecodable ones sort last. The ordered list is split into
-    n contiguous segments and one chunk is drawn at random from each segment, so
-    the sample covers the start, middle, and end of the session.
+    Chunks are time-ordered via their UUIDv1 directory epoch (undecodable ones
+    sort last). The ordered list is split into n contiguous segments and one chunk
+    is drawn at random from each segment, so the sample covers start/middle/end.
     """
     if len(blobs) <= n_samples:
         return list(blobs)
-    ordered = sorted(blobs, key=lambda b: (_uuid_v1_epoch(b) is None, _uuid_v1_epoch(b) or 0.0, b))
+    ordered = sorted(blobs, key=lambda b: (uuid_v1_epoch(b) is None, uuid_v1_epoch(b) or 0.0, b))
     n = len(ordered)
     picked = []
     for i in range(n_samples):
@@ -131,7 +195,7 @@ def classify_session(uuid_str: str, n_samples: int, seed: int) -> str:
     if capture_id is None:
         return ST_NODATA
 
-    ios_chunks = _gcs_list_chunks(_BUCKET, capture_id, "ios")
+    ios_chunks = gcs_list_chunks(_BUCKET, capture_id, "ios")
     if not ios_chunks:
         return ST_NOT_IOS
 
@@ -140,7 +204,7 @@ def classify_session(uuid_str: str, n_samples: int, seed: int) -> str:
 
     # Download the sampled chunks in parallel; early-exit on the first hit.
     with ThreadPoolExecutor(max_workers=min(len(sample), 8)) as ex:
-        futures = {ex.submit(_gcs_read_chunk_json, _BUCKET, b): b for b in sample}
+        futures = {ex.submit(gcs_read_chunk_json, _BUCKET, b): b for b in sample}
         try:
             for fut in as_completed(futures):
                 try:
@@ -155,12 +219,15 @@ def classify_session(uuid_str: str, n_samples: int, seed: int) -> str:
     return ST_IOS_NONE
 
 
-def iter_mongo_sessions(collection: str, limit):
+# --- Mongo enumeration ---------------------------------------------------------
+def iter_mongo_sessions(uri, db_name: str, collection: str, limit):
     """Yield distinct (uuid, deliveryType) from a Mongo collection (streamed)."""
-    uri = os.getenv("MONGO_MAIN_URI")
     if not uri:
-        raise SystemExit("MONGO_MAIN_URI is not set in the data-processing .env")
-    db = MongoClient(uri)[os.getenv("MONGO_MAIN_DB", "main")]
+        raise SystemExit(
+            "No Mongo URI configured. Set --mongo-uri / MONGO_URI / MONGO_MAIN_URI "
+            "(env or a local .env)."
+        )
+    db = MongoClient(uri)[db_name]
     cursor = db[collection].find(
         {"uuid": {"$exists": True, "$ne": None}}, {"uuid": 1, "deliveryType": 1, "_id": 0}
     )
@@ -178,8 +245,9 @@ def iter_mongo_sessions(collection: str, limit):
             yield u, ("" if delivery is None else str(delivery))
 
 
+# --- IO helpers ----------------------------------------------------------------
 def _load_checked(path):
-    """Return the set of UUIDs already classified (first CSV column), skipping header."""
+    """Set of UUIDs already recorded (first CSV column), skipping a 'uuid' header."""
     if not os.path.exists(path):
         return set()
     out = set()
@@ -194,11 +262,7 @@ def _load_checked(path):
 
 
 def write_report(checked_log_path, readme_path, meta):
-    """Tally the checked log and write a small markdown report.
-
-    Aggregates the persisted per-session statuses (resume-safe across runs), then
-    reports headphone sessions vs. total iOS sessions.
-    """
+    """Tally the checked log and write a small markdown report (resume-safe)."""
     tally = {ST_HEADPHONE: 0, ST_IOS_NONE: 0, ST_NOT_IOS: 0, ST_NODATA: 0}
     if os.path.exists(checked_log_path):
         with open(checked_log_path, newline="") as f:
@@ -258,12 +322,30 @@ def write_report(checked_log_path, readme_path, meta):
         f.write("\n".join(lines))
 
 
+def _resolve(cli_value, *env_keys, default=None):
+    """First non-empty of: CLI value, then each env var, then default."""
+    if cli_value:
+        return cli_value
+    for k in env_keys:
+        v = os.getenv(k)
+        if v:
+            return v
+    return default
+
+
 def main():
     global _BUCKET
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--collection", default=os.getenv("MONGO_TRACKING_COLLECTION", "tracking_sessions_v3"),
-                    help="Mongo collection of candidate UUIDs (default: MONGO_TRACKING_COLLECTION / tracking_sessions_v3)")
+    # Connection / config (all overridable; otherwise read from env / local .env).
+    ap.add_argument("--gcs-bucket", default=None, help="GCS bucket (else GCS_BUCKET)")
+    ap.add_argument("--gcs-key", default=None, help="path to GCS service-account JSON "
+                    "(else GCS_CREDENTIALS_PATH / GOOGLE_APPLICATION_CREDENTIALS; omit for ADC)")
+    ap.add_argument("--mongo-uri", default=None, help="Mongo URI (else MONGO_URI / MONGO_MAIN_URI)")
+    ap.add_argument("--mongo-db", default=None, help="Mongo db (else MONGO_DB / MONGO_MAIN_DB, default main)")
+    ap.add_argument("--collection", default=None, help="Mongo collection of candidate UUIDs "
+                    "(else MONGO_COLLECTION / MONGO_TRACKING_COLLECTION, default tracking_sessions_v3)")
+    # Scan / output knobs.
     ap.add_argument("--limit", type=int, default=None, help="cap the number of UUIDs pulled from Mongo")
     ap.add_argument("--workers", type=int, default=16, help="concurrent sessions to check (default: 16)")
     ap.add_argument("--samples", type=int, default=12, help="chunks sampled per session (default: 12)")
@@ -274,19 +356,31 @@ def main():
     ap.add_argument("--no-resume", dest="resume", action="store_false", help="re-check UUIDs even if already in the checked log")
     args = ap.parse_args()
 
-    _BUCKET = _gcs_client()[1]
+    bucket_name = _resolve(args.gcs_bucket, "GCS_BUCKET")
+    key_path = _resolve(args.gcs_key, "GCS_CREDENTIALS_PATH", "GOOGLE_APPLICATION_CREDENTIALS")
+    mongo_uri = _resolve(args.mongo_uri, "MONGO_URI", "MONGO_MAIN_URI")
+    mongo_db = _resolve(args.mongo_db, "MONGO_DB", "MONGO_MAIN_DB", default="main")
+    collection = _resolve(args.collection, "MONGO_COLLECTION", "MONGO_TRACKING_COLLECTION",
+                          default="tracking_sessions_v3")
+    if not bucket_name:
+        raise SystemExit("No GCS bucket configured. Set --gcs-bucket / GCS_BUCKET (env or local .env).")
+    if key_path and not os.path.isabs(key_path):
+        key_path = os.path.join(SCRIPT_DIR, key_path)  # resolve relative to this folder
+
+    _BUCKET = make_bucket(bucket_name, key_path)
 
     found = _load_checked(args.out)        # already-matched UUIDs (CSV col0; avoid dup rows)
     checked = _load_checked(args.checked_log) if args.resume else set()
+    print(f"[query] bucket={bucket_name} mongo_db={mongo_db} collection={collection}", flush=True)
     print(f"[query] resume: {len(found)} already found, {len(checked)} already checked", flush=True)
 
     delivery_by_uuid = {}
     pending = []
-    for u, delivery in iter_mongo_sessions(args.collection, args.limit):
+    for u, delivery in iter_mongo_sessions(mongo_uri, mongo_db, collection, args.limit):
         delivery_by_uuid[u] = delivery
         if u not in checked:
             pending.append(u)
-    print(f"[query] {len(pending)} session(s) to check from '{args.collection}' "
+    print(f"[query] {len(pending)} session(s) to check "
           f"(workers={args.workers}, samples/session={args.samples})", flush=True)
 
     out_lock = threading.Lock()
@@ -351,7 +445,7 @@ def main():
         args.readme,
         {
             "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "collection": args.collection,
+            "collection": collection,
             "samples": args.samples,
             "seed": args.seed,
         },
